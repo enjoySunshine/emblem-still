@@ -1,0 +1,17 @@
+# 
+
+# FourCC
+"ALPH"
+"ANIM"
+"ANMF"
+"EXIF"
+"ICCP"
+"RIFF"
+"VP8 "
+"VP8L"
+"VP8X"
+"WEBP"
+"XMP "
+
+# VP8 signature
+"\x9D\x01\x2A"
