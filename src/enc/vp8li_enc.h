@@ -68,6 +68,8 @@ typedef struct {
   int cache_bits;                  // If equal to 0, don't use color cache.
 
   // Encoding parameters derived from image characteristics.
+  int use_fast_spatial;  // Flat image: skip the exhaustive predictor and
+                         // cross-color searches.
   int use_cross_color;
   int use_subtract_green;
   int use_predict;

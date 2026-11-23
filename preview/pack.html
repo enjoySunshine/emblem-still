@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<!--
+  Copyright 2026 Google Inc. All Rights Reserved.
+
+  Use of this source code is governed by a BSD-style license
+  that can be found in the COPYING file in the root of the source
+  tree. An additional intellectual property rights grant can be found
+  in the file PATENTS. All contributing project authors may
+  be found in the AUTHORS file in the root of the source tree.
+-->
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Pack preview</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font-family: system-ui, sans-serif;
+    }
+    body {
+      margin: 1.5rem;
+    }
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+    }
+    .layout {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.5rem;
+      align-items: flex-start;
+    }
+    figure {
+      margin: 0;
+    }
+    figcaption {
+      font-size: 0.85rem;
+      opacity: 0.75;
+      margin-top: 0.35rem;
+    }
+    canvas {
+      display: block;
+      background: #111318;
+      image-rendering: pixelated;
+      border: 1px solid rgba(128, 128, 128, 0.4);
+    }
+    #animCanvas {
+      width: 240px;
+      height: 360px;
+    }
+    #buttonCanvas {
+      width: 480px;
+      height: 270px;
+    }
+    #stripCanvas {
+      width: 480px;
+      height: 90px;
+      cursor: crosshair;
+    }
+    table {
+      border-collapse: collapse;
+      font-size: 0.9rem;
+      font-variant-numeric: tabular-nums;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.3rem 0.9rem 0.3rem 0;
+      border-bottom: 1px solid rgba(128, 128, 128, 0.25);
+    }
+    th {
+      font-weight: 600;
+    }
+    .ok {
+      color: #1a7f37;
+      font-weight: 600;
+    }
+    .bad {
+      color: #cf222e;
+      font-weight: 700;
+    }
+    .controls {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      margin: 0.75rem 0 1rem;
+      font-size: 0.9rem;
+    }
+    .controls input[type="number"] {
+      width: 4.5rem;
+    }
+    #status {
+      font-size: 0.9rem;
+      min-height: 1.2rem;
+      opacity: 0.8;
+    }
+    .note {
+      font-size: 0.8rem;
+      opacity: 0.7;
+      max-width: 42rem;
+    }
+  </style>
+</head>
+<body>
+<h1>Lossless pack preview</h1>
+
+<div class="controls">
+  <label>quality <input id="quality" type="number" min="0" max="100" step="1" value="75"></label>
+  <label>method <input id="method" type="number" min="0" max="6" step="1" value="4"></label>
+  <button id="repack" type="button">Repack</button>
+  <span id="status">Loading…</span>
+</div>
+
+<div class="layout">
+  <figure>
+    <canvas id="buttonCanvas" width="1280" height="720"></canvas>
+    <figcaption>Button backdrop, decoded from this run's lossless file.</figcaption>
+  </figure>
+
+  <figure>
+    <canvas id="animCanvas" width="160" height="240"></canvas>
+    <figcaption>Walk cycle, eight decoded frames, step 50 ms.</figcaption>
+  </figure>
+
+  <div>
+    <table>
+      <thead>
+        <tr><th>Output</th><th>ms</th><th>bytes</th><th>pixel diffs</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>Button backdrop (single)</td><td id="btnMs">–</td><td id="btnBytes">–</td><td id="btnDiff">–</td></tr>
+        <tr><td>Walk strip (single)</td><td id="stripMs">–</td><td id="stripBytes">–</td><td id="stripDiff">–</td></tr>
+        <tr><td>Walk animation (8 frames)</td><td id="animMs">–</td><td id="animBytes">–</td><td id="animDiff">–</td></tr>
+        <tr><td>Grain check</td><td id="grainMs">–</td><td id="grainBytes">–</td><td id="grainDiff">–</td></tr>
+      </tbody>
+    </table>
+    <figure style="margin-top: 1rem;">
+      <canvas id="stripCanvas" width="1280" height="240"></canvas>
+      <figcaption>Walk strip source. Click a pixel to change it, then the
+        animation is repacked from the edited strip.</figcaption>
+    </figure>
+    <p class="note">
+      quality and method are passed through to the encoder as-is. The
+      eight-frame animation is always packed with the same pair as the button
+      backdrop, so changing them repacks both.
+    </p>
+  </div>
+</div>
+
+<script src="./pack_wasm.js"></script>
+<script>
+'use strict';
+
+// Pixel format: 32-bit ARGB stored little-endian, i.e. B, G, R, A bytes. This
+// is the layout of the *.argb files in tests/ and what the wasm wrappers use.
+
+const state = {
+  module: null,
+  quality: 75,
+  method: 4,
+  button: null,     // { bytes, width, height }  source pixels
+  strip: null,      // { bytes, width, height }  source pixels
+  grain: null,      // { bytes, width, height }
+  frames: [],       // decoded animation frames (Uint8ClampedArray RGBA)
+  timestamps: [],
+  frameWidth: 160,
+  animTimer: 0,
+  animStart: 0,
+  animFrameIndex: 0,
+};
+
+function readNumber(id) {
+  return Number(document.getElementById(id).value);
+}
+
+function setStatus(text) {
+  document.getElementById('status').textContent = text;
+}
+
+async function loadArgb(url, width, height) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(url + ': HTTP ' + response.status);
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.length !== width * height * 4) {
+    throw new Error(url + ': expected ' + (width * height * 4) + ' bytes, got ' + bytes.length);
+  }
+  return { bytes, width, height };
+}
+
+function upload(module, data) {
+  const ptr = module._malloc(data.length);
+  module.HEAPU8.set(data, ptr);
+  return ptr;
+}
+
+// Swaps B and R in place so that BGRA becomes RGBA for putImageData().
+function bgraToRgbaInto(src, srcOffset, dst, pixelCount) {
+  for (let i = 0; i < pixelCount; ++i) {
+    const s = srcOffset + i * 4;
+    const d = i * 4;
+    dst[d + 0] = src[s + 2];
+    dst[d + 1] = src[s + 1];
+    dst[d + 2] = src[s + 0];
+    dst[d + 3] = src[s + 3];
+  }
+}
+
+function paintCanvas(canvas, pixels, width, height, offset) {
+  const ctx = canvas.getContext('2d');
+  const image = ctx.createImageData(width, height);
+  bgraToRgbaInto(pixels, offset || 0, image.data, width * height);
+  ctx.putImageData(image, 0, 0);
+}
+
+// Runs the four packs with the current quality/method and updates the page.
+// Every number and every picture shown comes from this single call.
+function repack() {
+  const module = state.module;
+  if (!module) return;
+  state.quality = readNumber('quality');
+  state.method = readNumber('method');
+
+  const outSize = module._malloc(4);
+  const outW = module._malloc(4);
+  const outH = module._malloc(4);
+  const countPtr = module._malloc(4);
+  const tsPtr = module._malloc(4);
+  const tsBytesPtr = module._malloc(4);
+
+  const buttonSrc = state.button;
+  const stripSrc = state.strip;
+  const grainSrc = state.grain;
+  const buttonPtr = upload(module, buttonSrc.bytes);
+  const stripPtr = upload(module, stripSrc.bytes);
+  const grainPtr = upload(module, grainSrc.bytes);
+
+  const results = {};
+
+  // --- Button backdrop: one still image -----------------------------------
+  let start = performance.now();
+  const buttonFile = module._pk_encode(buttonPtr, buttonSrc.width, buttonSrc.height,
+                                       state.quality, state.method, outSize);
+  results.buttonMs = performance.now() - start;
+  results.buttonBytes = module.HEAPU32[outSize >> 2];
+  const buttonData = module._pk_decode(buttonFile, results.buttonBytes, outW, outH);
+  const buttonW = module.HEAPU32[outW >> 2];
+  const buttonH = module.HEAPU32[outH >> 2];
+  const buttonPixels = new Uint8Array(module.HEAPU8.subarray(buttonData, buttonData + buttonW * buttonH * 4));
+  results.buttonDiffs = countDiffs(buttonPixels, buttonSrc.bytes, buttonSrc.bytes.length);
+  paintCanvas(document.getElementById('buttonCanvas'), buttonPixels, buttonW, buttonH, 0);
+
+  // --- Walk strip: one still image ----------------------------------------
+  start = performance.now();
+  const stripFile = module._pk_encode(stripPtr, stripSrc.width, stripSrc.height,
+                                      state.quality, state.method, outSize);
+  results.stripMs = performance.now() - start;
+  results.stripBytes = module.HEAPU32[outSize >> 2];
+  const stripData = module._pk_decode(stripFile, results.stripBytes, outW, outH);
+  const stripW = module.HEAPU32[outW >> 2];
+  const stripH = module.HEAPU32[outH >> 2];
+  const stripPixels = new Uint8Array(module.HEAPU8.subarray(stripData, stripData + stripW * stripH * 4));
+  results.stripDiffs = countDiffs(stripPixels, stripSrc.bytes, stripSrc.bytes.length);
+  paintCanvas(document.getElementById('stripCanvas'), stripSrc.bytes, stripSrc.width, stripSrc.height, 0);
+
+  // --- Walk animation: eight frames cut from the strip --------------------
+  const frameCount = 8;
+  const frameWidth = stripSrc.width / frameCount;
+  start = performance.now();
+  const animFile = module._pk_encode_anim(stripPtr, stripSrc.width, stripSrc.height,
+                                          frameWidth, frameCount,
+                                          state.quality, state.method, outSize);
+  results.animMs = performance.now() - start;
+  results.animBytes = module.HEAPU32[outSize >> 2];
+  const animData = module._pk_decode_anim(animFile, results.animBytes, countPtr,
+                                          outW, outH, tsPtr, tsBytesPtr);
+  const animCount = module.HEAPU32[countPtr >> 2];
+  const canvasW = module.HEAPU32[outW >> 2];
+  const canvasH = module.HEAPU32[outH >> 2];
+  const tsArray = module.HEAPU32[tsPtr >> 2];
+  const tsCount = module.HEAPU32[tsBytesPtr >> 2] / 4;
+  const timestamps = [];
+  for (let i = 0; i < tsCount; ++i) timestamps.push(module.HEAPU32[(tsArray >> 2) + i]);
+  const frameBytes = canvasW * canvasH * 4;
+  state.frames = [];
+  state.timestamps = timestamps;
+  state.frameWidth = canvasW;
+  results.animDiffs = 0;
+  for (let f = 0; f < animCount; ++f) {
+    const frame = new Uint8ClampedArray(module.HEAPU8.subarray(
+        animData + f * frameBytes, animData + (f + 1) * frameBytes));
+    state.frames.push(frame);
+    // Compare this decoded frame with the matching segment of the source strip.
+    for (let y = 0; y < canvasH; ++y) {
+      const srcRow = y * stripSrc.width * 4 + f * frameWidth * 4;
+      const dstRow = y * canvasW * 4;
+      for (let x = 0; x < canvasW * 4; ++x) {
+        if (frame[dstRow + x] !== stripSrc.bytes[srcRow + x]) ++results.animDiffs;
+      }
+    }
+  }
+
+  // --- Grain check: one still image ---------------------------------------
+  start = performance.now();
+  const grainFile = module._pk_encode(grainPtr, grainSrc.width, grainSrc.height,
+                                      state.quality, state.method, outSize);
+  results.grainMs = performance.now() - start;
+  results.grainBytes = module.HEAPU32[outSize >> 2];
+  const grainData = module._pk_decode(grainFile, results.grainBytes, outW, outH);
+  const grainW = module.HEAPU32[outW >> 2];
+  const grainH = module.HEAPU32[outH >> 2];
+  const grainPixels = new Uint8Array(module.HEAPU8.subarray(grainData, grainData + grainW * grainH * 4));
+  results.grainDiffs = countDiffs(grainPixels, grainSrc.bytes, grainSrc.bytes.length);
+
+  module._free(buttonFile); module._free(stripFile); module._free(animFile);
+  module._free(grainFile);
+  module._free(buttonData); module._free(stripData); module._free(animData);
+  module._free(grainData);
+  module._free(outSize); module._free(outW); module._free(outH);
+  module._free(countPtr); module._free(tsPtr); module._free(tsBytesPtr);
+  module._free(buttonPtr); module._free(stripPtr); module._free(grainPtr);
+
+  report('btn', results.buttonMs, results.buttonBytes, results.buttonDiffs);
+  report('strip', results.stripMs, results.stripBytes, results.stripDiffs);
+  report('anim', results.animMs, results.animBytes, results.animDiffs);
+  report('grain', results.grainMs, results.grainBytes, results.grainDiffs);
+
+  const anyBad = results.buttonDiffs || results.stripDiffs ||
+                 results.animDiffs || results.grainDiffs;
+  setStatus(anyBad ? 'Pixel mismatch detected — see the diffs column.'
+                   : 'All decoded frames match the sources pixel for pixel.');
+  startAnimation();
+}
+
+function countDiffs(a, b, length) {
+  let diffs = 0;
+  for (let i = 0; i < length; ++i) {
+    if (a[i] !== b[i]) ++diffs;
+  }
+  return diffs;
+}
+
+function report(prefix, ms, bytes, diffs) {
+  document.getElementById(prefix + 'Ms').textContent = ms.toFixed(1);
+  document.getElementById(prefix + 'Bytes').textContent = String(bytes);
+  const cell = document.getElementById(prefix + 'Diff');
+  cell.textContent = String(diffs);
+  cell.className = diffs === 0 ? 'ok' : 'bad';
+}
+
+function startAnimation() {
+  cancelAnimationFrame(state.animTimer);
+  if (state.frames.length === 0) return;
+  state.animStart = performance.now();
+  state.animFrameIndex = -1;
+  const canvas = document.getElementById('animCanvas');
+  const ctx = canvas.getContext('2d');
+  const image = ctx.createImageData(canvas.width, canvas.height);
+  const tick = () => {
+    const elapsed = (performance.now() - state.animStart) % 400;
+    // The animation shows frames from timestamp 0 to 400, one every 50 ms.
+    let index = Math.floor(elapsed / 50);
+    if (index >= state.frames.length) index = state.frames.length - 1;
+    if (index !== state.animFrameIndex) {
+      state.animFrameIndex = index;
+      // Decoded frames are BGRA; putImageData() wants RGBA.
+      bgraToRgbaInto(state.frames[index], 0, image.data, canvas.width * canvas.height);
+      ctx.putImageData(image, 0, 0);
+    }
+    state.animTimer = requestAnimationFrame(tick);
+  };
+  state.animTimer = requestAnimationFrame(tick);
+}
+
+// Clicking the strip preview changes that pixel in the source buffer, which
+// is what both the still and the animation are packed from.
+function onStripClick(event) {
+  const canvas = document.getElementById('stripCanvas');
+  const rect = canvas.getBoundingClientRect();
+  const x = Math.floor((event.clientX - rect.left) * canvas.width / rect.width);
+  const y = Math.floor((event.clientY - rect.top) * canvas.height / rect.height);
+  if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return;
+  const offset = (y * canvas.width + x) * 4;
+  const bytes = state.strip.bytes;
+  bytes[offset + 0] ^= 0xff;
+  bytes[offset + 1] ^= 0xff;
+  bytes[offset + 2] ^= 0xff;
+  repack();
+}
+
+window.addEventListener('load', async () => {
+  try {
+    const module = await PackModule({ locateFile: (file) => './' + file });
+    state.module = module;
+    setStatus('Loading images…');
+    const [button, strip, grain] = await Promise.all([
+      loadArgb('../tests/button-atlas.argb', 1280, 720),
+      loadArgb('../tests/walk-cycle.argb', 1280, 240),
+      loadArgb('../tests/grain-check.argb', 640, 360),
+    ]);
+    state.button = button;
+    state.strip = strip;
+    state.grain = grain;
+    document.getElementById('repack').addEventListener('click', repack);
+    document.getElementById('stripCanvas').addEventListener('click', onStripClick);
+    repack();
+  } catch (error) {
+    setStatus('Failed to start: ' + error.message +
+              ' (serve this directory over HTTP, e.g. python3 -m http.server)');
+    console.error(error);
+  }
+});
+</script>
+</body>
+</html>

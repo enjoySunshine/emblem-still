@@ -347,6 +347,27 @@ static void AddPaletteSortingConfigs(
   }
 }
 
+// Returns the percentage (0..100, rounded down) of pixels whose color is equal
+// to the pixel on their left or above them. Flat images (UI panels, sprites on
+// a plain background) score high; photographic or noisy content scores low.
+static int GetFlatRatioPercent(const WebPPicture* const pic) {
+  const int width = pic->width;
+  const int height = pic->height;
+  const int stride = pic->argb_stride;
+  const uint32_t* const argb = pic->argb;
+  int64_t flat = 0;
+  int x, y;
+  for (y = 0; y < height; ++y) {
+    const uint32_t* const row = argb + (int64_t)y * stride;
+    for (x = 0; x < width; ++x) {
+      const uint32_t v = row[x];
+      flat += (x > 0 && v == row[x - 1]) ||
+              (y > 0 && v == row[x - stride]);
+    }
+  }
+  return (int)((flat * 100) / ((int64_t)width * height));
+}
+
 WEBP_NODISCARD static int EncoderAnalyze(
     VP8LEncoder* const enc, CrunchConfig crunch_configs[CRUNCH_CONFIGS_MAX],
     int* const crunch_configs_size,
@@ -371,6 +392,12 @@ WEBP_NODISCARD static int EncoderAnalyze(
   if (!use_palette) {
     enc->palette_size = 0;
   }
+
+  // Flat images do not benefit from the exhaustive predictor and cross-color
+  // searches: the low-effort predictor is already (near-)optimal for them, and
+  // the extra trials only cost time. Probing flatness is a single cheap pass.
+  enc->use_fast_spatial = !low_effort && config->quality >= 50 &&
+                          GetFlatRatioPercent(pic) >= 50;
 
   // Empirical bit sizes.
   enc->histo_bits = GetHistoBits(method, use_palette, pic->width, pic->height);
@@ -441,6 +468,29 @@ WEBP_NODISCARD static int EncoderAnalyze(
                                    crunch_configs_size);
         }
       }
+    }
+  }
+  if (enc->use_fast_spatial) {
+    // A single LZ77 trial is enough for flat images: the extra trial only
+    // helps tiny palettes in the general case.
+    n_lz77s = 1;
+    if (use_palette) {
+      // Keep the two cheap palette orderings only. The local-search
+      // refinements (kMinLA*) are what dominate the encoding time on flat
+      // images, and the size they buy there is marginal. kDirect never wins
+      // when a palette fits, so drop it too.
+      int n = 0;
+      for (i = 0; i < *crunch_configs_size; ++i) {
+        const CrunchConfig* const c = &crunch_configs[i];
+        const int is_palette =
+            (c->entropy_idx == kPalette) ||
+            (c->entropy_idx == kPaletteAndSpatial);
+        if (is_palette && c->palette_sorting_type == kMinimizeDelta &&
+            n < 2) {
+          crunch_configs[n++] = *c;
+        }
+      }
+      if (n > 0) *crunch_configs_size = n;
     }
   }
   // Fill in the different LZ77s.
@@ -1142,8 +1192,9 @@ WEBP_NODISCARD static int ApplyPredictFilter(
       max_bits - 2 * (enc->config->method > 4 ? enc->config->method - 4 : 0),
       MIN_TRANSFORM_BITS, MAX_TRANSFORM_BITS, MAX_PREDICTOR_IMAGE_SIZE);
 
-  if (!VP8LResidualImage(width, height, min_bits, max_bits, low_effort,
-                         enc->argb, enc->argb_scratch, enc->transform_data,
+  if (!VP8LResidualImage(width, height, min_bits, max_bits,
+                         low_effort || enc->use_fast_spatial, enc->argb,
+                         enc->argb_scratch, enc->transform_data,
                          near_lossless_strength, enc->config->exact,
                          used_subtract_green, enc->pic, percent_range / 2,
                          percent, best_bits)) {
@@ -1599,6 +1650,7 @@ WEBP_NODISCARD static int EncodeStreamHook(void* input, void* data2) {
     } else {
       enc->use_cross_color =
           red_and_blue_transformed_always_zero ? 0 : enc->use_predict;
+      if (enc->use_fast_spatial) enc->use_cross_color = 0;
     }
     // Reset any parameter in the encoder that is set in the previous iteration.
     enc->cache_bits = 0;
@@ -1836,6 +1888,7 @@ int VP8LEncodeStream(const WebPConfig* const config,
           goto Error;
         }
         // Copy the values that were computed for the main encoder.
+        enc_side->use_fast_spatial = enc_main->use_fast_spatial;
         enc_side->histo_bits = enc_main->histo_bits;
         enc_side->predictor_transform_bits = enc_main->predictor_transform_bits;
         enc_side->cross_color_transform_bits =
